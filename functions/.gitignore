@@ -4,3 +4,6 @@ __pycache__/
 # Python virtual environment
 venv/
 *.local
+
+# API Keys and secrets
+*.env
