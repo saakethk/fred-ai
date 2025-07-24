@@ -338,6 +338,8 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
                 "alpaca_order_id": buy_stock_res["id"],
                 "timestamp": firestore.SERVER_TIMESTAMP
             }
+            if "associated_actions" not in update:
+                update["associated_actions"] = []
             update["associated_actions"].append(assoc_action)
             update_ref = firestore_client.collection("updates").document(event.data.id)
             update_ref.set(update)
@@ -364,6 +366,8 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
                     "alpaca_order_id": sell_request["id"],
                     "timestamp": firestore.SERVER_TIMESTAMP
                 }
+                if "associated_actions" not in update:
+                    update["associated_actions"] = []
                 update["associated_actions"].append(assoc_action)
                 update_ref = firestore_client.collection("updates").document(event.data.id)
                 update_ref.set(update)
@@ -418,7 +422,7 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
     if signal == "bullish":
         buy_stock(symbol=symbol, amount=100)
     elif signal == "bearish":
-        liquadate_position(symbol=symbol, percent=100, bypass_ownership_check=True)
+        liquadate_position(symbol=symbol, percent=100)
 
 
 # Utilizes post sentiments about stocks to post to twitter
