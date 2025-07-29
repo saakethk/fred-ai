@@ -1,114 +1,27 @@
+# MAIN BACKEND CODE FOR FIREBASE FUNCTIONS
 
-# DEPENDENCIES
-from firebase_functions import https_fn, options, scheduler_fn
+# Dependencies
+from firebase_functions import https_fn, options, scheduler_fn, tasks_fn
 from firebase_functions.firestore_fn import on_document_created, Event, DocumentSnapshot
-from firebase_admin import initialize_app, firestore
-from datetime import datetime, timezone, timedelta
+from firebase_functions.options import RetryConfig, RateLimits, SupportedRegion
+from firebase_admin import initialize_app, firestore, functions
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
 import google.cloud.firestore
-from google import genai
 import requests
 import google
 import json
 from requests_oauthlib import OAuth1Session
-import os
-import json
-from dotenv import load_dotenv
+from fred_ai import get_stock_updates
+from helper import get_data_finnhub, get_credentials, parse_data, post_data_alpaca, get_data_alpaca, del_data_alpaca, log, get_timestamp
+from datetime import datetime, timedelta
 
-# Initializes firebase app and dotenv
-load_dotenv() # This loads variables from the .env file
+
+# Initializes firebase app
 initialize_app()
 
-# BACKEND FUNCTIONS
-
-# Retrieves secret keys
-client = genai.Client(api_key=os.getenv("GOOGLE_GENAI_API_KEY"))
-news_api_key = os.getenv("NEWS_API_KEY")
-stocks_api_key = os.getenv("STOCKS_API_KEY")
-market_api_keys = (os.getenv("MARKET_API_KEY"), os.getenv("MARKET_API_SECRET"))
-twitter_api_keys = (os.getenv("TWITTER_API_KEY"), os.getenv("TWITTER_API_SECRET"))
-twitter_access_tokens = (os.getenv("TWITTER_ACCESS_TOKEN"), os.getenv("TWITTER_ACCESS_TOKEN_SECRET"))
-
-# Gets timestamp in accesible format
-def get_timestamp(with_date=False, delta=1) -> str:
-    now = datetime.now(timezone.utc) - timedelta(hours=delta)
-    if with_date == False:
-        return now.strftime("%Y-%m-%d")
-    return now.strftime("%Y-%m-%dT%H")
-
-# Gets data from finnhub
-def get_data_finnhub(url: str, params: dict) -> tuple[bool, dict | str]:
-    response = requests.get(f"https://finnhub.io/{url}", params=params)
-    response_object = response.json()
-    if "message" in response_object:
-        return False, response_object["message"]
-    else:
-        return True, response_object
+# FRED AI BACKEND FUNCTIONS
     
-# Gets updates regarding stock (recurring)
-def get_stock_updates(symbol: str, name: str):
-
-    # Gets stock price from finnhub
-    def get_stock_price() -> tuple[bool, list]:
-        params = {
-            "symbol": symbol,
-            "token": stocks_api_key
-        }
-        return get_data_finnhub(url="api/v1/quote", params=params)
-
-    # Gets news from a news api
-    def get_news_elsewhere() -> tuple[bool, list]:
-        params = {
-            "api_token": news_api_key,
-            "search": f"{symbol} | {name}",
-            "search_fields": "title,description,keywords,main_text",
-            "language": "en",
-            "published_on": get_timestamp(),
-            "published_after": get_timestamp(with_date=True, delta=1),
-            "categories": "business"
-        }
-        response = requests.get("https://api.thenewsapi.com/v1/news/all", params=params)
-        response_object = response.json()
-        if "data" in response_object:
-            return True, response.json()["data"]
-        return False, "Failed to retrieve articles"
-
-    # Analyzes articles to summarize
-    def analyze_news(articles: list) -> tuple[bool, dict]:
-
-        # Calculates mean relevance of articles to identify whether or not to post the data
-        sources = []
-        parsed_articles = []
-        for article in articles:
-            if article["relevance_score"] > 15:
-                parsed_articles.append(article)
-                sources.append(article["url"])
-
-        # Generates AI summary
-        if len(parsed_articles) != 0:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=f"Review the following list of articles which mention {symbol} and write a concise 100-150 word summary of all the articles combined without mentioning 'the articles'. Also choose one of the following stances (bearish, bullish, neutral) and defend it. Return the response in a structured json output which matches the following: {{ summary: __________, stance: ______________, defense: ______________ }}. Articles: {articles}",
-            )
-            response = response.text
-            parsed_response = json.loads(response[response.index("{"): response.index("}")+1])
-            parsed_response["sources"] = sources
-
-            # Gets stock price at time
-            status, stock_price_res = get_stock_price()
-            if status == True:
-                parsed_response["price"] = stock_price_res
-                return True, parsed_response
-            else:
-                return False, stock_price_res
-        return False, "Insufficient number of relevant articles"
-
-    # Returns relevant data
-    status, news_articles_res = get_news_elsewhere()
-    if status == True:
-        return analyze_news(articles=news_articles_res)
-    else:
-        return False, news_articles_res
-
 # Indexes stock on first mention (one time)
 @https_fn.on_request()
 def index_stock(req: https_fn.Request) -> https_fn.Response:
@@ -120,7 +33,7 @@ def index_stock(req: https_fn.Request) -> https_fn.Response:
     def get_gen_info():
         params ={
             "symbol": symbol,
-            "token": stocks_api_key
+            "token": get_credentials("stocks_api_key"),
         }
         status, info_object = get_data_finnhub(url="api/v1/stock/profile2", params=params)
         if status == True:
@@ -187,30 +100,25 @@ def update_stocks(req: https_fn.Request) -> https_fn.Response:
 
 # Runs update stock function when market conditions satisfied
 @scheduler_fn.on_schedule(schedule="0 */1 * * *")
-def update_stocks_auto(event: scheduler_fn.ScheduledEvent) -> https_fn.Response:
+def update_stocks_auto(event: scheduler_fn.ScheduledEvent) -> None:
 
     # Gets market status when run
     params = {
         "exchange": "US",
-        "token": stocks_api_key
+        "token": get_credentials("stocks_api_key"),
     }
     status, market_status = get_data_finnhub(url="api/v1/stock/market-status", params=params)
     if status == True:
         if market_status["isOpen"] == True:
             update_status = requests.get("https://update-stocks-ovr4mzor3q-uc.a.run.app")
-            print(update_status.status_code, update_status.text)
+            log(update_status.status_code)
+            log(update_status.text)
         else:
-            print("Market is closed")
+            log("Market is closed")
     else:
-        print("Failed to get market status")
+        log("Failed to get market status")
 
 # USER FUNCTIONS
-
-# Parses data for user creation
-def parseData(key: str, response: dict):
-    if key in response.keys():
-        return response[key]
-    return None
 
 # Runs on user sign-up
 @https_fn.on_request(cors=options.CorsOptions(cors_origins="*", cors_methods=["post"]))
@@ -221,13 +129,13 @@ def addUser(req: https_fn.Request) -> https_fn.Response:
 
     # Define User object according to schema
     user = {
-        "id": parseData("id", request_body),
-        "first_name": parseData("first_name", request_body),
-        "last_name": parseData("last_name", request_body),
-        "created": parseData("updated_at", request_body),
-        "active_at": [parseData("last_sign_in_at", request_body)],
-        "email_address": parseData("email_address", request_body["email_addresses"][0]) if (parseData("email_addresses", request_body) != None) else None,
-        "avatar": parseData("profile_image_url", request_body),
+        "id": parse_data("id", request_body),
+        "first_name": parse_data("first_name", request_body),
+        "last_name": parse_data("last_name", request_body),
+        "created": parse_data("updated_at", request_body),
+        "active_at": [parse_data("last_sign_in_at", request_body)],
+        "email_address": parse_data("email_address", request_body["email_addresses"][0]) if (parse_data("email_addresses", request_body) != None) else None,
+        "avatar": parse_data("profile_image_url", request_body),
         "watchlist": [],
         "searched": []
     }
@@ -245,8 +153,8 @@ def updateUser(req: https_fn.Request) -> https_fn.Response:
 
     # Retrieves relevant clerk data
     request_body = req.get_json()["data"]
-    user_id = parseData("user_id", request_body)
-    active_at = parseData("last_active_at", request_body)
+    user_id = parse_data("user_id", request_body)
+    active_at = parse_data("last_active_at", request_body)
 
     if active_at != None:
 
@@ -265,49 +173,6 @@ def updateUser(req: https_fn.Request) -> https_fn.Response:
     return https_fn.Response(f"User with ID {user["id"]} updated.")
 
 # ALPACA INTEGRATION
-
-# Gets data from alpaca
-def get_data_alpaca(url: str) -> tuple[bool, dict | str]:
-    headers = {
-        "accept": "application/json",
-        "APCA-API-KEY-ID": market_api_keys[0],
-        "APCA-API-SECRET-KEY": market_api_keys[1]
-    }
-    response = requests.get(f"https://paper-api.alpaca.markets/{url}", headers=headers)
-    response_object = response.json()
-    if "message" in response_object:
-        return False, response_object["message"]
-    else:
-        return True, response_object
-    
-# Delete data from Alpaca
-def del_data_alpaca(url: str) -> tuple[bool, dict | str]:
-    headers = {
-        "accept": "application/json",
-        "APCA-API-KEY-ID": market_api_keys[0],
-        "APCA-API-SECRET-KEY": market_api_keys[1]
-    }
-    response = requests.delete(f"https://paper-api.alpaca.markets/{url}", headers=headers)
-    response_object = response.json()
-    if "message" in response_object:
-        return False, response_object["message"]
-    else:
-        return True, response_object
-    
-# Posts data to alpaca
-def post_data_alpaca(url: str, payload: dict) -> tuple[bool, dict | str]:
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "APCA-API-KEY-ID": market_api_keys[0],
-        "APCA-API-SECRET-KEY": market_api_keys[1]
-    }
-    response = requests.post(f"https://paper-api.alpaca.markets/{url}", headers=headers, json=payload)
-    response_object = response.json()
-    if "message" in response_object:
-        return False, response_object["message"]
-    else:
-        return True, response_object
 
 # Utilizes post sentiments about stocks to paper trade
 @on_document_created(document="updates/{updateId}")
@@ -329,7 +194,7 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
         }
         status, buy_stock_res = post_data_alpaca(url="v2/orders", payload=payload)
         if status == True:
-            print("Stock bought successfully")
+            log("Stock bought successfully")
             if "associated_actions" not in update:
                 update["assocaited_actions"] = []
             assoc_action = {
@@ -346,18 +211,18 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
             order_ref = firestore_client.collection("orders")
             order_ref.add(assoc_action)
         else:
-            print(buy_stock_res)
+            log(buy_stock_res)
 
     # Liquadates positions in case of bearish signal
     def liquadate_position(symbol: str, percent: int) -> None:
         # Gets open position of symbol
         status, open_pos_res = get_data_alpaca(url=f"v2/positions/{symbol}")
-        print(open_pos_res)
+        log(open_pos_res)
         if (status == True):
             # Sells stock
             status, sell_request = del_data_alpaca(url=f"v2/positions/{symbol}?percentage={percent}")
             if status == True:
-                print("Stock sold successfully")
+                log("Stock sold successfully")
                 if "associated_actions" not in update:
                     update["assocaited_actions"] = []
                 assoc_action = {
@@ -374,9 +239,9 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
                 order_ref = firestore_client.collection("orders")
                 order_ref.create(assoc_action)
             else:
-                print(sell_request)
+                log(sell_request)
         else:
-            print("No open position found for symbol:", symbol)
+            log("No open position found for symbol:", symbol)
             # If no open position, sells shorts on stock
             sell_stock(symbol=symbol, amount=100)
 
@@ -396,9 +261,9 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
                 }
                 status, buy_stock_res = post_data_alpaca(url="v2/orders", payload=payload)
                 if status == True:
-                    print("Stock bought successfully")
+                    log("Stock bought successfully")
                     if "associated_actions" not in update:
-                        update["assocaited_actions"] = []
+                        update["associated_actions"] = []
                     assoc_action = {
                         "type": "order",
                         "action": "sell",
@@ -411,11 +276,11 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
                     order_ref = firestore_client.collection("orders")
                     order_ref.add(assoc_action)
                 else:
-                    print(buy_stock_res)
+                    log(buy_stock_res)
             else:
-                print("Insufficient funds")
+                log("Insufficient funds")
         else:
-            print(account_res)
+            log(account_res)
         
     # Reads update and runs correct function
     symbol, signal = update["symbol"], update["stance"]
@@ -424,6 +289,7 @@ def paper_trade(event: Event[DocumentSnapshot]) -> None:
     elif signal == "bearish":
         liquadate_position(symbol=symbol, percent=100)
 
+# TWITTER INTEGRATION
 
 # Utilizes post sentiments about stocks to post to twitter
 @on_document_created(document="updates/{updateId}")
@@ -434,7 +300,7 @@ def create_tweet(event: Event[DocumentSnapshot]) -> None:
     update = event.data.to_dict()
 
     # Summarizes summary even further via AI
-    summary = client.models.generate_content(
+    summary = get_credentials("client").models.generate_content(
         model="gemini-2.5-flash",
         contents=f"Summarize the following summary of stock news into an objective, engaging 240 character tweet. The word limit is very strict and cannot go over 240 characters but can be below. Summary: {update['summary']}",
     )
@@ -451,10 +317,10 @@ def create_tweet(event: Event[DocumentSnapshot]) -> None:
 
     # Make the request
     oauth = OAuth1Session(
-        twitter_api_keys[0],
-        client_secret=twitter_api_keys[1],
-        resource_owner_key=twitter_access_tokens[0],
-        resource_owner_secret=twitter_access_tokens[1],
+        get_credentials("twitter_api_keys")[0],
+        client_secret=get_credentials("twitter_api_keys")[1],
+        resource_owner_key=get_credentials("twitter_access_tokens")[0],
+        resource_owner_secret=get_credentials("twitter_access_tokens")[1],
     )
 
     # Making the request
@@ -468,7 +334,7 @@ def create_tweet(event: Event[DocumentSnapshot]) -> None:
             "Request returned an error: {} {}".format(response.status_code, response.text)
         )
 
-    print("Response code: {}".format(response.status_code))
+    log("Response code: {}".format(response.status_code))
 
     # Parses response for tweet id
     tweet_id = response.json()["data"]["id"]
@@ -476,4 +342,3 @@ def create_tweet(event: Event[DocumentSnapshot]) -> None:
     update["associated_tweet_summary"] = summary.text
     update_ref = firestore_client.collection("updates").document(event.data.id)
     update_ref.set(update)
-
